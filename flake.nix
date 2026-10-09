@@ -10,7 +10,7 @@
 					pkgs.rustc
 					pkgs.cargo
 					pkgs.rust-analyzer
-					pkgs.ruftfmt
+					pkgs.rustfmt
 					pkgs.clippy
 				];
 
