@@ -1,7 +1,7 @@
 // TODO: Remove all unwrap
 // TODO: Make the buffer going into this a runtime flag? Also allow for unbounded as toggle?
+use crate::sources::SourceConfig;
 use clap::Parser;
-use notify::{Config, Event, EventKind, INotifyWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use serde_json::{Number, Value};
 use std::path::{Path, PathBuf};
@@ -12,6 +12,8 @@ use tokio::{
     task::JoinSet,
 };
 use tracing::{Level, error, info, span};
+
+mod sources;
 
 const LONG_ABOUT: &str = "Switchyard is a configurable data routing engine for building reusable data pipelines. It connects data sources, transformations, and sinks to move and process data between systems without requiring a separate application for every integration.";
 
@@ -34,12 +36,6 @@ struct SwitchyardConfig {
 #[derive(Debug, Deserialize)]
 struct PipelineData {
     id: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum SourceConfig {
-    File { path: PathBuf, read_full: bool },
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,19 +159,6 @@ async fn start_sink(sink: SinkConfig, receiver: &mut mpsc::Receiver<Envelope>) {
     }
 }
 
-fn event_touches_path(event: &Event, path: &Path) -> bool {
-    event.paths.iter().any(|event_path| {
-        event_path == path
-            || event_path
-                .file_name()
-                .is_some_and(|file_name| Some(file_name) == path.file_name())
-    })
-}
-
-fn is_file_change(kind: &EventKind) -> bool {
-    kind.is_create() || kind.is_modify() || kind.is_remove()
-}
-
 async fn start_transform(
     transforms: Vec<TransformConfig>,
     sender: mpsc::Sender<Envelope>,
@@ -228,76 +211,6 @@ async fn start_transform(
     }
 }
 
-async fn start_source(source: SourceConfig, sender: mpsc::Sender<Envelope>) {
-    match source {
-        SourceConfig::File { path, read_full } => {
-            let (file_watcher_sender, mut file_watcher_receiver) = mpsc::channel(100);
-            let watch_path = path.parent().unwrap_or_else(|| Path::new("."));
-            let mut watcher = INotifyWatcher::new(
-                move |res| {
-                    let _ = file_watcher_sender.blocking_send(res);
-                },
-                Config::default(),
-            )
-            .unwrap();
-            watcher
-                .watch(watch_path, RecursiveMode::NonRecursive)
-                .unwrap();
-
-            let mut last_position = 0;
-            let mut last_payload: Option<Vec<u8>> = None;
-            while let Some(event) = file_watcher_receiver.recv().await {
-                match event {
-                    Ok(v) => {
-                        if !is_file_change(&v.kind) || !event_touches_path(&v, &path) {
-                            continue;
-                        }
-
-                        let mut contents: Vec<u8> = Vec::new();
-                        if read_full {
-                            contents = match fs::read(&path).await {
-                                Ok(contents) => contents,
-                                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                                Err(e) => panic!("could not read watched file: {e}"),
-                            };
-                        } else {
-                            let mut file = File::open(&path).await.unwrap();
-                            let file_size = file.metadata().await.unwrap().len();
-                            if file_size < last_position {
-                                last_position = 0;
-                            }
-
-                            file.seek(SeekFrom::Start(last_position)).await.unwrap();
-                            if file.read_to_end(&mut contents).await.unwrap() > 0 {
-                                last_position += contents.len() as u64;
-                            }
-                        }
-
-                        if contents.is_empty() {
-                            continue;
-                        }
-
-                        if read_full && last_payload.as_ref().is_some_and(|last| last == &contents)
-                        {
-                            continue;
-                        }
-
-                        if read_full {
-                            last_payload = Some(contents.clone());
-                        }
-
-                        let message = Envelope { payload: contents };
-                        sender.send(message).await.unwrap();
-                    }
-                    Err(_) => {
-                        todo!()
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
@@ -324,7 +237,7 @@ async fn main() -> io::Result<()> {
     let sink = switchyard_config.sink;
 
     info!(pipeline_id, "starting source");
-    set.spawn(async move { start_source(source, source_tx).await });
+    set.spawn(async move { sources::start_source(source, source_tx).await });
 
     match transforms {
         Some(transforms) => {
