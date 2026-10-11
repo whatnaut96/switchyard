@@ -1,11 +1,17 @@
-use std::{
-    fs::File,
-    io::{self, Read},
-    path::PathBuf,
-};
-
+// TODO: Remove all unwrap
+// TODO: Make the buffer going into this a runtime flag? Also allow for unbounded as toggle?
+use chrono::{DateTime, Utc};
 use clap::Parser;
+use notify::{Config, INotifyWatcher, RecursiveMode, Watcher};
 use serde::Deserialize;
+use serde_json::{Number, Value};
+use std::path::PathBuf;
+use tokio::{
+    fs::{self, File},
+    io::{self, AsyncReadExt, AsyncWriteExt},
+    sync::mpsc,
+};
+use tracing::{Level, info, span};
 
 const LONG_ABOUT: &str = "Switchyard is a configurable data routing engine for building reusable data pipelines. It connects data sources, transformations, and sinks to move and process data between systems without requiring a separate application for every integration.";
 
@@ -33,7 +39,7 @@ struct PipelineData {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SourceConfig {
-    File { path: PathBuf },
+    File { path: PathBuf, read_full: bool },
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,26 +47,22 @@ enum SourceConfig {
 enum TransformConfig {
     Filter {
         key: String,
-        val: String,
         condition: TransformCondition,
         compare_to: toml::Value,
-    },
-    ToJson,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum SinkConfig {
-    Http {
-        uri: String,
-        encoding: HttpSinkEncoding,
+        codec: AcceptableCodecs,
     },
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum HttpSinkEncoding {
+enum AcceptableCodecs {
     Json,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SinkConfig {
+    Stdout,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,18 +77,205 @@ enum TransformCondition {
     Matches,
 }
 
-fn main() -> io::Result<()> {
+#[derive(Debug)]
+struct Envelope {
+    timestamp: chrono::DateTime<chrono::Utc>,
+    payload: Vec<u8>,
+}
+
+fn toml_to_json_value(value: &toml::Value) -> Value {
+    match value {
+        toml::Value::String(value) => Value::String(value.clone()),
+        toml::Value::Integer(value) => Value::Number(Number::from(*value)),
+        toml::Value::Float(value) => Number::from_f64(*value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        toml::Value::Boolean(value) => Value::Bool(*value),
+        toml::Value::Datetime(value) => Value::String(value.to_string()),
+        toml::Value::Array(values) => Value::Array(values.iter().map(toml_to_json_value).collect()),
+        toml::Value::Table(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), toml_to_json_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+fn get_json_value_at_key<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    key.split('.').try_fold(value, |current, key_part| {
+        current.as_object()?.get(key_part)
+    })
+}
+
+fn values_equal(left: &Value, right: &Value) -> bool {
+    match (left.as_f64(), right.as_f64()) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn compare_ordered(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    match (left.as_f64(), right.as_f64()) {
+        (Some(left), Some(right)) => left.partial_cmp(&right),
+        _ => match (left.as_str(), right.as_str()) {
+            (Some(left), Some(right)) => Some(left.cmp(right)),
+            _ => None,
+        },
+    }
+}
+
+fn condition_matches(
+    data_value: &Value,
+    condition: &TransformCondition,
+    compare_to: &Value,
+) -> bool {
+    match condition {
+        TransformCondition::EqualTo => values_equal(data_value, compare_to),
+        TransformCondition::NotEqual => !values_equal(data_value, compare_to),
+        TransformCondition::GreaterThanEqual => {
+            compare_ordered(data_value, compare_to).is_some_and(|ordering| ordering.is_ge())
+        }
+        TransformCondition::GreaterThan => {
+            compare_ordered(data_value, compare_to).is_some_and(|ordering| ordering.is_gt())
+        }
+        TransformCondition::LessThanEqual => {
+            compare_ordered(data_value, compare_to).is_some_and(|ordering| ordering.is_le())
+        }
+        TransformCondition::LessThan => {
+            compare_ordered(data_value, compare_to).is_some_and(|ordering| ordering.is_lt())
+        }
+        TransformCondition::Matches => match (data_value.as_str(), compare_to.as_str()) {
+            (Some(data_value), Some(compare_to)) => data_value.contains(compare_to),
+            _ => values_equal(data_value, compare_to),
+        },
+    }
+}
+
+async fn start_sink(sink: SinkConfig, receiver: &mut mpsc::Receiver<Envelope>) {
+    while let Some(_message) = receiver.recv().await {
+        match sink {
+            SinkConfig::Stdout => {
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(&_message.payload).await.unwrap();
+                stdout.flush().await.unwrap();
+            }
+        }
+    }
+}
+
+async fn start_transform(
+    transforms: Vec<TransformConfig>,
+    sender: mpsc::Sender<Envelope>,
+    receiver: &mut mpsc::Receiver<Envelope>,
+) {
+    while let Some(message) = receiver.recv().await {
+        let data = message.payload;
+        let envelope_data: Vec<u8> = data.clone();
+        let mut should_send = true;
+        for transform in &transforms {
+            match transform {
+                TransformConfig::Filter {
+                    key,
+                    condition,
+                    compare_to,
+                    codec,
+                } => match codec {
+                    AcceptableCodecs::Json => {
+                        let json_data: Value = serde_json::from_slice(data.as_slice()).unwrap();
+                        let compare_to = toml_to_json_value(compare_to);
+                        should_send =
+                            get_json_value_at_key(&json_data, key).is_some_and(|data_value| {
+                                condition_matches(data_value, condition, &compare_to)
+                            });
+                    }
+                },
+            }
+
+            if !should_send {
+                break;
+            }
+        }
+
+        if !should_send {
+            continue;
+        }
+
+        let message_timestamp: DateTime<Utc> = Utc::now();
+
+        let envelope = Envelope {
+            timestamp: message_timestamp,
+            payload: envelope_data,
+        };
+
+        sender.send(envelope).await.unwrap();
+    }
+}
+
+async fn start_source(source: SourceConfig, sender: mpsc::Sender<Envelope>) {
+    match source {
+        SourceConfig::File { path, read_full } => {
+            let (file_watcher_sender, mut file_watcher_receiver) = mpsc::channel(100);
+            let mut watcher = INotifyWatcher::new(
+                move |res| {
+                    let _ = file_watcher_sender.blocking_send(res);
+                },
+                Config::default(),
+            )
+            .unwrap();
+            watcher.watch(&path, RecursiveMode::NonRecursive).unwrap();
+
+            let mut file = File::open(&path).await.unwrap();
+            while let Some(_) = file_watcher_receiver.recv().await {
+                let mut contents: Vec<u8> = Vec::new();
+                let message_timestamp: DateTime<Utc> = Utc::now();
+                if read_full {
+                    file.read_to_end(&mut contents).await.unwrap();
+                } else {
+                    file.read(&mut contents).await.unwrap();
+                }
+
+                let message = Envelope {
+                    timestamp: message_timestamp,
+                    payload: contents,
+                };
+                sender.send(message).await.unwrap();
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    tracing_subscriber::fmt::init();
     let args = Args::parse();
-    let mut config_file = File::open(args.file)?;
-    let mut config_contents = String::new();
-    config_file.read_to_string(&mut config_contents)?;
+
+    let config_contents = fs::read_to_string(args.file).await?;
     let switchyard_config: SwitchyardConfig = match toml::from_str(&config_contents) {
         Ok(v) => v,
         Err(e) => {
             panic!("could not deserialize config: {e}")
         }
     };
-    println!("Hello, world!");
-    println!("{:?}", switchyard_config);
+
+    println!("{:?}", switchyard_config.source);
+
+    let pipeline_id = switchyard_config.pipeline.id.as_str();
+    let span = span!(Level::INFO, "pipeline_operation");
+    let _guard = span.enter();
+
+    let (sink_tx, mut sink_rx) = mpsc::channel::<Envelope>(32);
+    let (source_tx, mut source_rx) = mpsc::channel::<Envelope>(32);
+
+    info!(pipeline_id, "starting source");
+    tokio::task::spawn(async move { start_source(switchyard_config.source, source_tx).await });
+
+    info!(pipeline_id, "starting transforms");
+    tokio::task::spawn(async move {
+        start_transform(switchyard_config.transform, sink_tx, &mut source_rx).await
+    });
+
+    info!(pipeline_id, "starting sink");
+    tokio::task::spawn(async move { start_sink(switchyard_config.sink, &mut sink_rx).await });
     Ok(())
 }
