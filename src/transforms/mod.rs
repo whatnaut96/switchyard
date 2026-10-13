@@ -1,7 +1,12 @@
 use crate::Envelope;
+use mlua::{Function, Lua, Result, Table};
 use serde::Deserialize;
 use serde_json::{Number, Value};
-use tokio::sync::mpsc::{Receiver, Sender};
+use std::path::PathBuf;
+use tokio::{
+    fs,
+    sync::mpsc::{Receiver, Sender},
+};
 use tracing::error;
 
 #[derive(Debug, Deserialize)]
@@ -12,6 +17,9 @@ pub enum TransformConfig {
         condition: TransformCondition,
         compare_to: toml::Value,
         codec: AcceptableCodecs,
+    },
+    Lua {
+        path: PathBuf,
     },
 }
 
@@ -109,7 +117,7 @@ pub async fn start_transform(
 ) {
     while let Some(message) = receiver.recv().await {
         let data = message.payload;
-        let envelope_data: Vec<u8> = data.clone();
+        let mut envelope_data: Vec<u8> = data.clone();
         let mut should_send = true;
         for transform in &transforms {
             match transform {
@@ -135,6 +143,21 @@ pub async fn start_transform(
                             });
                     }
                 },
+                TransformConfig::Lua { path } => {
+                    let script = fs::read_to_string(path).await.unwrap();
+                    let lua = Lua::new();
+                    let globals = lua.globals();
+                    let _ = mlua_json::preload(&lua);
+                    lua.load(script).set_name("script.lua").exec().unwrap();
+                    let input_string = lua.create_string(&envelope_data).unwrap();
+                    let lua_transform: Function = globals.get("lua_transform").unwrap();
+                    let result: Table = lua_transform.call(input_string).unwrap();
+                    let values: Vec<u8> = result
+                        .sequence_values::<u8>()
+                        .collect::<Result<Vec<_>>>()
+                        .unwrap();
+                    envelope_data = values;
+                }
             }
 
             if !should_send {
