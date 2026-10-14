@@ -7,7 +7,7 @@ use tokio::{
     fs,
     sync::mpsc::{Receiver, Sender},
 };
-use tracing::error;
+use tracing::{debug, error};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -144,19 +144,84 @@ pub async fn start_transform(
                     }
                 },
                 TransformConfig::Lua { path } => {
-                    let script = fs::read_to_string(path).await.unwrap();
+                    let path_display = path.display();
+                    let script = match fs::read_to_string(path).await {
+                        Ok(contents) => contents,
+                        Err(e) => {
+                            error!(error = %e, custom_script_path = %path_display, "could not read the custom lua script");
+                            should_send = false;
+                            break;
+                        }
+                    };
                     let lua = Lua::new();
                     let globals = lua.globals();
-                    let _ = mlua_json::preload(&lua);
-                    lua.load(script).set_name("script.lua").exec().unwrap();
-                    let input_string = lua.create_string(&envelope_data).unwrap();
-                    let lua_transform: Function = globals.get("lua_transform").unwrap();
-                    let result: Table = lua_transform.call(input_string).unwrap();
-                    let values: Vec<u8> = result
+                    match mlua_json::preload(&lua) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            panic!(
+                                "COULD NOT LOAD LUA JSON MODULE. SWITCHYARD CANNOT CONTINUE IN THIS STATE: {e}"
+                            );
+                        }
+                    };
+
+                    let script_name = match path.clone().into_os_string().into_string() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            error!(custom_script_path = %path_display, "could not convert the path of the script to a string");
+                            should_send = false;
+                            break;
+                        }
+                    };
+
+                    if let Err(e) = lua.load(&script).set_name(script_name).exec() {
+                        error!(error = %e, custom_script_path = %path_display, "could not parse or execute the custom lua transform");
+                        should_send = false;
+                        break;
+                    }
+
+                    let lua_input_string = match lua.create_string(&envelope_data) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(error = %e, custom_script_path = %path_display, "could not create a custom lua string for the payload");
+                            should_send = false;
+                            break;
+                        }
+                    };
+
+                    let lua_transform_function: Function = match globals.get("lua_transform") {
+                        Ok(f) => f,
+                        Err(e) => {
+                            error!(error = %e, custom_script_path = %path_display, "the custom script does not have a function called lua_transform");
+                            should_send = false;
+                            break;
+                        }
+                    };
+
+                    let lua_transform_return_table: Table = match lua_transform_function
+                        .call(lua_input_string)
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            error!(error = %e, custom_script_path = %path_display, "the custom transform function's return value could not be read as a table");
+                            should_send = false;
+                            break;
+                        }
+                    };
+
+                    let values = match lua_transform_return_table
                         .sequence_values::<u8>()
                         .collect::<Result<Vec<_>>>()
-                        .unwrap();
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!(error = %e, custom_script_path = %path_display, "could not convert the table to a vector of bytes");
+                            should_send = false;
+                            break;
+                        }
+                    };
+
                     envelope_data = values;
+                    should_send = !envelope_data.is_empty();
                 }
             }
 
@@ -173,6 +238,14 @@ pub async fn start_transform(
             payload: envelope_data,
         };
 
-        sender.send(envelope).await.unwrap();
+        let vol = envelope.payload.len();
+        match sender.send(envelope).await {
+            Ok(_) => {
+                debug!(segment = "transform", "sent {vol} bytes to channel");
+            }
+            Err(e) => {
+                error!(segment = "transform", error = %e, "could not send data to the receiver");
+            }
+        }
     }
 }
