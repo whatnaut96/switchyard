@@ -2,6 +2,7 @@ use crate::Envelope;
 use serde::Deserialize;
 use tokio::io::{AsyncWriteExt, stdout};
 use tokio::sync::mpsc::Receiver;
+use tracing::error;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -14,8 +15,14 @@ pub async fn start_sink(sink: SinkConfig, receiver: &mut Receiver<Envelope>) {
         match sink {
             SinkConfig::Stdout => {
                 let mut stdout = stdout();
-                stdout.write_all(&_message.payload).await.unwrap();
-                stdout.flush().await.unwrap();
+                if let Err(e) = stdout.write_all(&_message.payload).await {
+                    error!(error = %e, "could not write payload to stdout");
+                    panic!("could not write payload to stdout: {e}");
+                }
+                if let Err(e) = stdout.flush().await {
+                    error!(error = %e, "could not flush stdout");
+                    panic!("could not flush stdout: {e}");
+                }
             }
         }
     }
